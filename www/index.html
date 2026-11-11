@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Punctuate — Writing Assistant</title>
+<style>
+:root{color-scheme:light;--ink:#182235;--muted:#64748b;--line:#e2e8f0;--blue:#2563eb;--bg:#f5f7fb}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);font:15px/1.5 Inter,system-ui,Arial;color:var(--ink)}
+main{max-width:900px;margin:42px auto;padding:0 20px}.top{margin-bottom:24px}.top h1{margin:0;font-size:29px}.top p{margin:5px 0;color:var(--muted)}
+.panel{background:white;border:1px solid var(--line);border-radius:16px;padding:22px;box-shadow:0 8px 30px #0f172a0a}
+#status{font-size:13px;color:var(--muted);margin:0 0 14px}.suggestions{display:grid;gap:10px;margin-bottom:16px}
+.card{border:1px solid #bfdbfe;background:#eff6ff;border-radius:12px;padding:13px 14px;display:flex;gap:12px;align-items:center;justify-content:space-between}
+.card p{margin:0;flex:1}.card small{display:block;color:#475569;margin-top:3px}.actions{display:flex;gap:7px;flex-shrink:0}
+button{border:0;border-radius:8px;padding:8px 13px;font-weight:650;cursor:pointer}.accept{background:#2563eb;color:white}.ignore{background:#e2e8f0;color:#334155}
+.editor-wrap{position:relative;border:1px solid var(--line);border-radius:12px;overflow:hidden;background:white}
+#editor,#highlights{font:16px/1.75 ui-monospace,SFMono-Regular,Consolas,monospace;padding:18px;white-space:pre-wrap;overflow-wrap:break-word;word-break:normal;letter-spacing:0}
+#editor{display:block;width:100%;min-height:250px;resize:none;overflow:hidden;border:0;outline:0;color:var(--ink);background:transparent;position:relative;z-index:2}
+#highlights{position:absolute;inset:0;overflow:hidden;pointer-events:none;color:transparent;z-index:1}
+.mark{position:relative;display:inline-block;width:0}
+.mark::after{content:"";position:absolute;left:-2px;top:3px;bottom:3px;width:4px;background:#facc15;border-radius:2px;box-shadow:0 0 0 1px #eab308}
+.footer{display:flex;justify-content:space-between;gap:12px;align-items:center;margin-top:12px;color:var(--muted);font-size:13px}
+#engine{font-weight:650;color:#475569}.empty{color:var(--muted);font-size:13px;padding:5px 2px}
+@media(max-width:600px){main{margin:22px auto}.panel{padding:15px}.card{align-items:flex-start;flex-direction:column}.actions{align-self:flex-end}}
+</style></head>
+<body><main>
+<header class="top"><h1>✍️ Punctuate</h1><p>Clearer sentences, one thoughtful suggestion at a time.</p></header>
+<section class="panel">
+<div id="status" aria-live="polite">Start typing. Suggestions appear after you pause.</div>
+<div id="suggestions" class="suggestions" aria-live="polite"></div>
+<div class="editor-wrap"><div id="highlights" aria-hidden="true"></div><textarea id="editor" spellcheck="true" placeholder="Type or paste your text here…"></textarea></div>
+<div class="footer"><span id="engine">Waiting for text</span><span>Suggestions are optional — you stay in control.</span></div>
+</section></main>
+<script src="engine.js"></script>
+<script>
+const editor=document.querySelector('#editor'), marks=document.querySelector('#highlights'), list=document.querySelector('#suggestions'), statusEl=document.querySelector('#status'), engineEl=document.querySelector('#engine');
+let timer=null, suggestions=[], ignored=new Set(), requestNo=0, currentText='';
+const IDLE='Start typing. Suggestions appear after you pause.';
+// The Android app has no server: it always uses the on-device engine.
+const isNative=!!(window.Capacitor&&window.Capacitor.isNativePlatform&&window.Capacitor.isNativePlatform());
+const canUseServer=!isNative&&/^https?:$/.test(location.protocol);
+function escapeHtml(s){return s.replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+// The server counts Unicode code points; JavaScript strings count UTF-16 units.
+function cpToUtf16(text,i){return Array.from(text).slice(0,i).join('').length;}
+// Ignored suggestions are remembered by what they say and where, not by random id.
+function keyOf(s,text){return s.kind+'|'+s.mark+'|'+text.slice(Math.max(0,s.start-20),s.start);}
+function isIgnored(s){return ignored.has(keyOf(s,editor.value));}
+function active(){return suggestions.filter(s=>s.start===s.end&&s.start<=editor.value.length&&!isIgnored(s));}
+function autosize(){editor.style.height='auto';editor.style.height=Math.max(250,editor.scrollHeight)+'px';}
+function renderMarks(){
+ const text=editor.value; let html='', pos=0;
+ for(const s of active().sort((a,b)=>a.start-b.start)){
+   if(s.start<pos)continue;
+   html+=escapeHtml(text.slice(pos,s.start))+'<span class="mark"></span>';pos=s.start;
+ }
+ marks.innerHTML=html+escapeHtml(text.slice(pos))+'\n';
+}
+function renderCards(){
+ list.innerHTML='';
+ const items=active();
+ if(!items.length){list.innerHTML='<div class="empty">No pending suggestions. Keep writing — new checks run automatically.</div>';return;}
+ items.forEach(s=>{
+  const card=document.createElement('div');card.className='card';
+  const p=document.createElement('p');p.innerHTML=`<strong>Insert “${escapeHtml(s.mark)}”</strong><small>${escapeHtml(s.explanation)} · ${Math.round(s.confidence*100)}% confidence</small>`;
+  const actions=document.createElement('div');actions.className='actions';
+  const a=document.createElement('button');a.className='accept';a.textContent='Accept';a.onclick=()=>accept(s.id);
+  const i=document.createElement('button');i.className='ignore';i.textContent='Ignore';i.onclick=()=>{ignored.add(keyOf(s,editor.value));renderCards();renderMarks();};
+  actions.append(a,i);card.append(p,actions);list.append(card);
+ });
+}
+function accept(id){
+ const s=suggestions.find(x=>x.id===id);if(!s)return;
+ const text=editor.value;
+ editor.value=text.slice(0,s.start)+s.mark+text.slice(s.end);
+ // Keep the remaining suggestions aligned with the edited text.
+ const delta=s.mark.length-(s.end-s.start);
+ suggestions=suggestions.filter(x=>x.id!==id&&x.start>s.start).map(x=>({...x,start:x.start+delta,end:x.end+delta}));
+ editor.focus();editor.setSelectionRange(s.start+s.mark.length,s.start+s.mark.length);
+ autosize();renderCards();renderMarks();schedule();
+}
+async function fetchSuggestions(text){
+ if(canUseServer){
+  try{
+   const r=await fetch('/analyze',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text,use_ai:true})});
+   if(r.ok){const d=await r.json();
+    d.suggestions=(d.suggestions||[]).map(s=>({...s,start:cpToUtf16(text,s.start),end:cpToUtf16(text,s.end)}));
+    return d;}
+  }catch(e){/* fall through to the on-device engine */}
+ }
+ return window.PunctuateEngine.analyze(text);
+}
+async function analyze(){
+ const text=editor.value;
+ if(!text.trim()){suggestions=[];list.innerHTML='';marks.innerHTML='';statusEl.textContent=IDLE;engineEl.textContent='Waiting for text';return;}
+ const thisRequest=++requestNo;statusEl.textContent='Checking punctuation…';
+ try{
+  const data=await fetchSuggestions(text);
+  if(thisRequest!==requestNo||editor.value!==text)return;
+  suggestions=data.suggestions||[];
+  engineEl.textContent='Engine: '+data.engine;
+  const n=active().length;
+  statusEl.textContent=n?`${n} suggestion(s) to review`:'No punctuation suggestions right now.';
+  renderCards();renderMarks();
+ }catch(e){statusEl.textContent='Something went wrong while checking the text.';engineEl.textContent='Check failed';}
+}
+function schedule(){clearTimeout(timer);statusEl.textContent='Waiting for you to pause…';timer=setTimeout(analyze,750);}
+editor.addEventListener('input',()=>{autosize();renderMarks();schedule();});
+editor.addEventListener('keydown',e=>{if(e.key==='Tab'){e.preventDefault();editor.setRangeText('  ',editor.selectionStart,editor.selectionEnd,'end');autosize();schedule();}});
+window.addEventListener('resize',()=>{autosize();renderMarks();});
+autosize();
+</script></body></html>
